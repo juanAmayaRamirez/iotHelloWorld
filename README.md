@@ -215,6 +215,236 @@ Publishing: {"distance":24,"unit":"cm"}
 
 ---
 
+## Step 9: Store Data in S3 (Partitioned)
+
+This creates an S3 bucket and an IoT Rule that automatically saves every message to S3, organized by date for easy querying later.
+
+**Data will be stored as:**
+```
+s3://YOUR_BUCKET/dt=2026-05-10/1715370000.json
+```
+
+### 9.1 Create the S3 bucket
+
+```bash
+aws s3api create-bucket --bucket esp32-sensor-data-<YOUR_ACCOUNT_ID> --region us-east-1
+```
+
+> Replace `<YOUR_ACCOUNT_ID>` with your AWS account ID. Bucket names must be globally unique.
+
+### 9.2 Create an IAM role for the IoT Rule
+
+The IoT Rule needs permission to write to S3. First, create the trust policy:
+
+```bash
+cat > iot-s3-trust-policy.json << 'EOF'
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "Service": "iot.amazonaws.com" },
+    "Action": "sts:AssumeRole"
+  }]
+}
+EOF
+```
+
+Create the role:
+
+```bash
+aws iam create-role \
+  --role-name iot-s3-rule-role \
+  --assume-role-policy-document file://iot-s3-trust-policy.json
+```
+
+Attach a policy that allows writing to your bucket:
+
+```bash
+cat > iot-s3-policy.json << EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": "s3:PutObject",
+    "Resource": "arn:aws:s3:::esp32-sensor-data-<YOUR_ACCOUNT_ID>/*"
+  }]
+}
+EOF
+
+aws iam put-role-policy \
+  --role-name iot-s3-rule-role \
+  --policy-name iot-s3-put \
+  --policy-document file://iot-s3-policy.json
+```
+
+### 9.3 Create the IoT Rule
+
+This rule listens to the `esp32/sensor/distance` topic and writes each message to S3, partitioned by date:
+
+```bash
+cat > iot-s3-rule.json << EOF
+{
+  "sql": "SELECT *, timestamp() as ts FROM 'esp32/sensor/distance'",
+  "awsIotSqlVersion": "2016-03-23",
+  "actions": [{
+    "s3": {
+      "bucketName": "esp32-sensor-data-<YOUR_ACCOUNT_ID>",
+      "key": "dt=\${parse_time(\"yyyy-MM-dd\", timestamp())}/\${timestamp()}.json",
+      "roleArn": "arn:aws:iam::<YOUR_ACCOUNT_ID>:role/iot-s3-rule-role"
+    }
+  }]
+}
+EOF
+
+aws iot create-topic-rule \
+  --rule-name esp32_to_s3 \
+  --topic-rule-payload file://iot-s3-rule.json \
+  --region us-east-1
+```
+
+### 9.4 Verify data lands in S3
+
+After the ESP32 publishes a few messages (or run `python publish_test.py`), check:
+
+```bash
+aws s3 ls s3://esp32-sensor-data-<YOUR_ACCOUNT_ID>/ --recursive --region us-east-1
+```
+
+You should see files like:
+```
+dt=2026-05-10/1715370000123.json
+dt=2026-05-10/1715370002456.json
+```
+
+Each file contains one JSON message:
+```json
+{"distance": 25, "unit": "cm", "ts": 1715370000123}
+```
+
+---
+
+---
+
+## Step 10: Store Data in AWS IoT SiteWise
+
+SiteWise is a managed service for collecting, organizing, and monitoring industrial IoT data. Unlike S3 (which stores raw files), SiteWise gives you built-in time-series storage, dashboards, and asset hierarchy.
+
+### 10.1 Create an Asset Model
+
+An asset model defines what properties your sensor has:
+
+```bash
+aws iotsitewise create-asset-model \
+  --asset-model-name "DistanceSensorModel" \
+  --asset-model-properties '[{
+    "name": "distance",
+    "dataType": "INTEGER",
+    "unit": "cm",
+    "type": {"measurement": {}}
+  }]' \
+  --region us-east-1
+```
+
+Save the `assetModelId` from the output.
+
+### 10.2 Create an Asset
+
+An asset is an instance of the model (your physical sensor):
+
+```bash
+aws iotsitewise create-asset \
+  --asset-name "ESP32-Sensor" \
+  --asset-model-id <assetModelId> \
+  --region us-east-1
+```
+
+Save the `assetId`. Then get the `propertyId` for "distance":
+
+```bash
+aws iotsitewise describe-asset --asset-id <assetId> --region us-east-1
+```
+
+Look for the property named "distance" in the output and save its `id`.
+
+> ⚠️ Wait until the asset status is `ACTIVE` before proceeding (takes ~1 minute).
+
+### 10.3 Create IAM Role for the Rule
+
+```bash
+cat > iot-sitewise-trust.json << 'EOF'
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "Service": "iot.amazonaws.com" },
+    "Action": "sts:AssumeRole"
+  }]
+}
+EOF
+
+aws iam create-role \
+  --role-name iot-sitewise-rule-role \
+  --assume-role-policy-document file://iot-sitewise-trust.json
+
+aws iam put-role-policy \
+  --role-name iot-sitewise-rule-role \
+  --policy-name iot-sitewise-put \
+  --policy-document '{
+    "Version": "2012-10-17",
+    "Statement": [{
+      "Effect": "Allow",
+      "Action": "iotsitewise:BatchPutAssetPropertyValue",
+      "Resource": "*"
+    }]
+  }'
+```
+
+### 10.4 Create the IoT Rule
+
+This rule takes each message from the ESP32 and writes the distance value into SiteWise:
+
+```bash
+cat > iot-sitewise-rule.json << EOF
+{
+  "sql": "SELECT * FROM 'esp32/sensor/distance'",
+  "awsIotSqlVersion": "2016-03-23",
+  "actions": [{
+    "iotSiteWise": {
+      "putAssetPropertyValueEntries": [{
+        "assetId": "<assetId>",
+        "propertyId": "<propertyId>",
+        "propertyValues": [{
+          "timestamp": { "timeInSeconds": "\${floor(timestamp() / 1E3)}", "offsetInNanos": "0" },
+          "value": { "integerValue": "\${distance}" }
+        }]
+      }],
+      "roleArn": "arn:aws:iam::<YOUR_ACCOUNT_ID>:role/iot-sitewise-rule-role"
+    }
+  }]
+}
+EOF
+
+aws iot create-topic-rule \
+  --rule-name esp32_to_sitewise \
+  --topic-rule-payload file://iot-sitewise-rule.json \
+  --region us-east-1
+```
+
+### 10.5 Verify data in SiteWise
+
+After publishing a few messages, check the property value:
+
+```bash
+aws iotsitewise get-asset-property-value-history \
+  --asset-id <assetId> \
+  --property-id <propertyId> \
+  --region us-east-1
+```
+
+You can also view the data in the AWS Console: **IoT SiteWise** → **Assets** → **ESP32-Sensor** → **distance**.
+
+---
+
 ## Python Test Publisher (Optional)
 
 You can also publish test data from your PC without the ESP32:
