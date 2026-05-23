@@ -72,5 +72,5 @@ void loop() {
   Serial.println(payload);
   client.publish(publishTopic, payload);
 
-  delay(2000);
+  delay(200);
 }

@@ -4,6 +4,11 @@
 
 In this lab you will connect an ESP32 microcontroller to AWS IoT Core over the internet. The ESP32 reads distance from an ultrasonic sensor and sends it to the cloud every 2 seconds using the MQTT protocol (a lightweight messaging protocol designed for IoT devices).
 
+![Architecture Diagram](image/78d43909-217a-466f-9c27-bbea5865fa0b.png)
+
+## Authentication
+![Architecture Diagram](image/aafb9d7c-a28d-4fb9-886e-84360163e149.png)
+
 **What happens:**
 
 ```
@@ -176,8 +181,9 @@ pio run
 ### Upload to ESP32
 
 If using WSL with USB passthrough:
-
+0. usbipd list
 1. In PowerShell (admin): `usbipd attach --wsl --busid <YOUR_BUSID>`
+   verify `ls /dev/ttyUSB*`
 2. On the ESP32: Hold **BOOT** → Press **EN** → Release **BOOT**
 3. Run:
 
